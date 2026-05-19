@@ -9,6 +9,8 @@ Wraps two endpoints:
 | `GET https://ai-gateway.vercel.sh/v1/models` | All available models with type, context window, pricing, tags. |
 | `GET https://ai-gateway.vercel.sh/v1/models/{creator}/{model}/endpoints` | Per-provider endpoints, pricing, and supported parameters for one model. |
 
+You don't need to know the schema or the exact model id — the CLI introspects response shapes (`schema`) and resolves fuzzy queries like `"claude opus"` or `"gpt 5.5"` into concrete model ids.
+
 ## Requirements
 
 Python 3.9+. Standard library only (`urllib`, `json`, `argparse`).
@@ -18,8 +20,9 @@ Python 3.9+. Standard library only (`urllib`, `json`, `argparse`).
 ```bash
 ./ai-gateway info
 ./ai-gateway models --type language --provider anthropic
-./ai-gateway providers anthropic/claude-opus-4.7
-./ai-gateway                          # drops into interactive REPL
+./ai-gateway providers "claude opus 4.7"          # fuzzy match — no need to know exact id
+./ai-gateway schema providers                     # describe the response shape, live
+./ai-gateway                                      # drops into interactive REPL
 ```
 
 Optional: drop it on your `PATH`.
@@ -86,13 +89,48 @@ ai-gateway models --type embedding --json | jq '.[].id'
 
 ### `providers` — provider endpoints for a single model
 
+The positional argument accepts an exact id **or** a partial name. Resolution:
+
+- Exact id → used directly.
+- Single fuzzy match → used, with a note showing what it resolved to.
+- Multiple matches in a TTY → interactive numbered picker.
+- Multiple matches non-interactively → listed on stderr, exit 1 (or pass `--first` to auto-pick the top score).
+
 ```bash
-ai-gateway providers anthropic/claude-opus-4.7
-ai-gateway providers google/gemini-3.1-pro-preview --params
-ai-gateway providers openai/gpt-5.5 --json
+ai-gateway providers anthropic/claude-opus-4.7              # exact id
+ai-gateway providers "claude opus 4.7"                      # fuzzy, resolves uniquely
+ai-gateway providers "claude opus"                          # ambiguous → picker / list
+ai-gateway providers "claude opus" --first                  # auto-pick top match
+ai-gateway providers "gemini 3 pro" --params                # adds supported_parameters
+ai-gateway providers openai/gpt-5.5 --json                  # raw JSON for jq
 ```
 
 Output: one row per provider hosting the model with context length, max output, prompt/completion pricing, cache-read pricing, implicit-caching support, and live status. Pass `--params` to also print each provider's `supported_parameters`.
+
+### `schema` — describe a gateway endpoint's response shape
+
+For when you don't know what fields the endpoint returns. Fetches a live sample, walks the JSON tree, and prints every field path with its type and an example value. Surfaces fields that aren't in the published docs (e.g. `latency_last_1h.p95`, `uptime_last_1d`, `throughput_last_1h`).
+
+```bash
+ai-gateway schema models                              # describe /v1/models
+ai-gateway schema providers                           # describe /v1/models/.../endpoints
+ai-gateway schema providers --model "gemini 3 pro"    # use a specific model as the sample
+ai-gateway schema providers --raw                     # pretty-printed sample JSON instead
+```
+
+Output is three columns — `path`, `type`, `example`:
+
+```
+path                                         type                     example
+data                                         object
+data.id                                      string                   "anthropic/claude-opus-4.7"
+data.architecture.modality                   string                   "text+image+file→text"
+data.endpoints[]                             array of object (len=3)
+data.endpoints[].provider_name               string                   "anthropic"
+data.endpoints[].pricing.prompt              string                   "0.000005"
+data.endpoints[].uptime_last_1h              number                   99.8574
+data.endpoints[].latency_last_1h.p95         number                   13880.6
+```
 
 ### `repl` — interactive shell
 
@@ -100,10 +138,13 @@ Drops you into a prompt where the same subcommands work without re-typing `ai-ga
 
 ```
 ai-gateway> models --tag tool-use --type language
-ai-gateway> providers anthropic/claude-opus-4.7
+ai-gateway> providers "claude opus 4.7"
+ai-gateway> schema providers
 ai-gateway> info
 ai-gateway> quit
 ```
+
+The REPL uses `shlex.split`, so quoted multi-word arguments like `providers "claude opus 4.7"` work as you'd expect.
 
 Running `./ai-gateway` with no arguments launches the REPL.
 

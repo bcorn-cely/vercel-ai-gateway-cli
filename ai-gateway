@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import shutil
 import sys
 import urllib.error
@@ -160,6 +162,210 @@ def match_search(m: dict[str, Any], q: str) -> bool:
     return q in (blob + " " + tags).lower()
 
 
+# ---------- fuzzy resolution ----------
+
+_NORM_RE = re.compile(r"[\s\-_/]+")  # keep '.' inside tokens so "5.5" stays whole
+
+
+def _norm(s: str) -> str:
+    return _NORM_RE.sub(" ", (s or "").lower()).strip()
+
+
+def fuzzy_score(m: dict[str, Any], query: str) -> int:
+    q = query.strip()
+    if not q:
+        return 0
+    if (m.get("id") or "").lower() == q.lower():
+        return 10_000
+    q_tokens = _norm(q).split()
+    if not q_tokens:
+        return 0
+    id_n = _norm(m.get("id") or "")
+    name_n = _norm(m.get("name") or "")
+    desc_n = _norm(m.get("description") or "")
+    strong = f"{id_n} {name_n}"
+    # Hard requirement: every query token must appear in id or name.
+    # Description is only used for scoring tiebreakers, never as a gate
+    # (otherwise "claude opus" would surface models whose docs mention Opus).
+    if not all(t in strong for t in q_tokens):
+        return 0
+    score = 0
+    if all(t in id_n for t in q_tokens):
+        score += 80
+    if all(t in name_n for t in q_tokens):
+        score += 50
+    for t in q_tokens:
+        if t in id_n:
+            score += 10
+        elif t in name_n:
+            score += 5
+        elif t in desc_n:
+            score += 1
+    # prefer shorter ids (less specific suffixes) when score ties
+    score -= len(m.get("id") or "") // 20
+    return score
+
+
+def fuzzy_search(models: list[dict[str, Any]], query: str, limit: int = 10) -> list[dict[str, Any]]:
+    scored = [(fuzzy_score(m, query), m) for m in models]
+    scored = [pair for pair in scored if pair[0] > 0]
+    scored.sort(key=lambda pair: (-pair[0], (pair[1].get("id") or "").lower()))
+    return [m for _, m in scored[:limit]]
+
+
+def _is_interactive() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def pick_one(candidates: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
+    print()
+    print(bold(f"{len(candidates)} matches for {query!r}:"))
+    for i, m in enumerate(candidates, 1):
+        name = m.get("name") or ""
+        typ = m.get("type") or ""
+        print(f"  {yellow(str(i).rjust(2))}  {m.get('id')}  {dim(f'({typ}) {name}')}")
+    print()
+    try:
+        raw = input(cyan("Pick a number (or blank to cancel): ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not raw:
+        return None
+    try:
+        idx = int(raw)
+    except ValueError:
+        print(red("Not a number."))
+        return None
+    if not (1 <= idx <= len(candidates)):
+        print(red("Out of range."))
+        return None
+    return candidates[idx - 1]
+
+
+def resolve_model_id(query: str, prefer: str | None = None) -> str:
+    """Return a concrete creator/model id, fuzzy-resolving query if needed.
+
+    prefer:
+      None       interactive picker when ambiguous and TTY; else error
+      'first'    silently take the highest-scoring match
+      'pick'     always show picker (even if 1 match)
+    """
+    models = list_models()
+    by_id = {m.get("id"): m for m in models if m.get("id")}
+
+    # exact match short-circuit
+    if query in by_id and prefer != "pick":
+        return query
+
+    candidates = fuzzy_search(models, query, limit=10)
+    if not candidates:
+        raise SystemExit(red(f"No models match {query!r}. Try `ai-gateway models --search '<term>'` to browse."))
+
+    if prefer == "first":
+        picked = candidates[0]
+        print(dim(f"→ Using {picked.get('id')} (highest-scoring match for {query!r})"))
+        return picked["id"]
+
+    if len(candidates) == 1 and prefer != "pick":
+        picked = candidates[0]
+        print(dim(f"→ Resolved {query!r} → {picked.get('id')}"))
+        return picked["id"]
+
+    if _is_interactive():
+        chosen = pick_one(candidates, query)
+        if not chosen:
+            raise SystemExit(yellow("Cancelled."))
+        return chosen["id"]
+
+    # non-interactive: list and exit
+    print(red(f"Ambiguous: {len(candidates)} models match {query!r}. Be more specific or use --first."), file=sys.stderr)
+    for m in candidates:
+        print(f"  {m.get('id')}  ({m.get('type')}) {m.get('name')}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# ---------- schema introspection ----------
+
+def _type_name(v: Any) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, int):
+        return "integer"
+    if isinstance(v, float):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return type(v).__name__
+
+
+def _sample(v: Any, n: int = 60) -> str:
+    s = json.dumps(v, ensure_ascii=False)
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
+
+def describe_schema(value: Any, prefix: str = "") -> list[tuple[str, str, str]]:
+    """Walk JSON value and produce [(path, type, example)] rows."""
+    rows: list[tuple[str, str, str]] = []
+
+    def walk(v: Any, path: str, suppress_header: bool = False) -> None:
+        if isinstance(v, dict):
+            if path and not suppress_header:
+                rows.append((path, "object", ""))
+            for k, sub in v.items():
+                child = f"{path}.{k}" if path else k
+                walk(sub, child)
+        elif isinstance(v, list):
+            if not v:
+                rows.append((f"{path}[]", "array (empty)", "[]"))
+                return
+            child_type = _type_name(v[0])
+            label = f"{path}[]"
+            if isinstance(v[0], dict):
+                rows.append((label, f"array of object (len={len(v)})", ""))
+                walk(v[0], label, suppress_header=True)
+            else:
+                rows.append((label, f"array of {child_type}", _sample(v[:3])))
+        else:
+            rows.append((path, _type_name(v), _sample(v)))
+
+    walk(value, prefix)
+    return rows
+
+
+def print_schema(label: str, raw: Any, full_endpoint: str, sample_note: str | None = None) -> None:
+    rows = describe_schema(raw)
+    print()
+    print(bold(label))
+    print(dim(full_endpoint))
+    if sample_note:
+        print(dim(sample_note))
+    print()
+    # widths
+    path_w = max((len(r[0]) for r in rows), default=4)
+    type_w = max((len(r[1]) for r in rows), default=4)
+    path_w = min(path_w, 60)
+    type_w = min(type_w, 28)
+    print(bold(f"{'path'.ljust(path_w)}  {'type'.ljust(type_w)}  example"))
+    print(dim("-" * path_w + "  " + "-" * type_w + "  " + "-" * 20))
+    for path, tname, ex in rows:
+        p = truncate(path, path_w).ljust(path_w)
+        t = truncate(tname, type_w).ljust(type_w)
+        print(f"{p}  {t}  {ex}")
+    print()
+
+
 # ---------- commands ----------
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -220,7 +426,9 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 
 def cmd_providers(args: argparse.Namespace) -> int:
-    data = model_endpoints(args.model)
+    prefer = "first" if getattr(args, "first", False) else ("pick" if getattr(args, "pick", False) else None)
+    model_id = resolve_model_id(args.model, prefer=prefer)
+    data = model_endpoints(model_id)
     if args.json:
         json.dump(data, sys.stdout, indent=2)
         sys.stdout.write("\n")
@@ -362,6 +570,75 @@ def build_summary(models: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+SCHEMA_SAMPLE_MODELS = [
+    "anthropic/claude-opus-4.7",
+    "openai/gpt-5.5",
+    "google/gemini-3.1-pro-preview",
+]
+
+
+def cmd_schema(args: argparse.Namespace) -> int:
+    endpoint = args.endpoint
+
+    if endpoint == "models":
+        raw = fetch_json("/models")
+        if args.raw:
+            json.dump({"object": raw.get("object"), "data": (raw.get("data") or [])[:1]}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
+        # narrow to representative shape: top-level + first data entry
+        sample = {
+            "object": raw.get("object"),
+            "data": [(raw.get("data") or [{}])[0]],
+        }
+        print_schema(
+            "GET /v1/models  —  list all models",
+            sample,
+            full_endpoint=f"{BASE_URL}/models",
+            sample_note=f"Sample drawn from data[0] (id: {(raw.get('data') or [{}])[0].get('id', '?')}). All data[] entries share this shape.",
+        )
+        return 0
+
+    if endpoint == "providers":
+        model_id = args.model
+        last_err: SystemExit | None = None
+        if model_id is None:
+            for candidate in SCHEMA_SAMPLE_MODELS:
+                try:
+                    data = fetch_json(f"/models/{candidate}/endpoints").get("data", {})
+                    model_id = candidate
+                    break
+                except SystemExit as e:
+                    last_err = e
+                    continue
+            else:
+                if last_err:
+                    raise last_err
+                raise SystemExit(red("Could not fetch a sample provider response."))
+        else:
+            data = model_endpoints(resolve_model_id(model_id))
+
+        if args.raw:
+            # collapse endpoints[] to the first entry for readability
+            shown = dict(data)
+            eps = shown.get("endpoints") or []
+            if eps:
+                shown["endpoints"] = [eps[0]]
+            json.dump({"data": shown}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
+
+        print_schema(
+            "GET /v1/models/{creator}/{model}/endpoints  —  provider endpoints for a model",
+            {"data": data},
+            full_endpoint=f"{BASE_URL}/models/{model_id}/endpoints",
+            sample_note=f"Sample drawn from {model_id}. Other models share this shape; some pricing fields are optional.",
+        )
+        return 0
+
+    raise SystemExit(red(f"Unknown schema endpoint: {endpoint}"))
+
+
 def cmd_repl(args: argparse.Namespace) -> int:
     print(bold("ai-gateway interactive shell"))
     print(dim("Commands: models [filters], providers <id>, info, help, quit"))
@@ -382,7 +659,12 @@ def cmd_repl(args: argparse.Namespace) -> int:
             parser.print_help()
             continue
         try:
-            ns = parser.parse_args(line.split())
+            argv = shlex.split(line)
+        except ValueError as e:
+            print(red(f"Parse error: {e}"))
+            continue
+        try:
+            ns = parser.parse_args(argv)
         except SystemExit:
             continue
         if not getattr(ns, "func", None):
@@ -413,15 +695,23 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--json", action="store_true", help="Output raw JSON")
     pm.set_defaults(func=cmd_models)
 
-    pp = sub.add_parser("providers", help="List provider endpoints + pricing for a model")
-    pp.add_argument("model", help="Model id in creator/model form (e.g. anthropic/claude-opus-4.7)")
+    pp = sub.add_parser("providers", help="List provider endpoints + pricing for a model (accepts partial names)")
+    pp.add_argument("model", help="Model id or partial name (e.g. 'claude opus', 'gpt-5.5', 'gemini 3 pro')")
     pp.add_argument("--params", action="store_true", help="Also print supported_parameters per provider")
+    pp.add_argument("--first", action="store_true", help="On ambiguous match, take the highest-scoring result")
+    pp.add_argument("--pick", action="store_true", help="Always show interactive picker, even for a single match")
     pp.add_argument("--json", action="store_true", help="Output raw JSON")
     pp.set_defaults(func=cmd_providers)
 
     pi = sub.add_parser("info", help="High-level summary of the gateway (counts, owners, tags, pricing)")
     pi.add_argument("--json", action="store_true", help="Output raw JSON")
     pi.set_defaults(func=cmd_info)
+
+    ps = sub.add_parser("schema", help="Describe the response shape of a gateway endpoint (introspected from live data)")
+    ps.add_argument("endpoint", choices=["models", "providers"], help="Which endpoint to describe")
+    ps.add_argument("--model", help="(providers only) Use a specific model as the sample. Accepts partial name.")
+    ps.add_argument("--raw", action="store_true", help="Print a pretty-printed sample JSON instead of the annotated walk")
+    ps.set_defaults(func=cmd_schema)
 
     pr = sub.add_parser("repl", help="Interactive shell")
     pr.set_defaults(func=cmd_repl)
